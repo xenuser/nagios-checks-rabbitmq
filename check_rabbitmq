@@ -19,6 +19,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import struct
@@ -45,26 +46,114 @@ STATE_NAMES = {
 }
 
 # =============================================================================
+# Debug / Logging
+# =============================================================================
+# Debug output goes to stderr so it never interferes with Nagios plugin output
+# on stdout. Enabled via --debug flag.
+# =============================================================================
+
+_debug_enabled = False
+
+
+def debug(msg: str) -> None:
+    """Print a debug message to stderr if debug mode is enabled."""
+    if _debug_enabled:
+        ts = time.strftime("%H:%M:%S", time.localtime())
+        print(f"[DEBUG {ts}] {msg}", file=sys.stderr)
+
+
+def sanitize(text: str, password: str, username: str = "") -> str:
+    """
+    Remove credentials from any string before it is logged or displayed.
+    Replaces the password (and base64-encoded forms of it) with '***'.
+    """
+    if not text:
+        return text
+    sanitized = text
+    if password:
+        sanitized = sanitized.replace(password, "***")
+        try:
+            b64_creds = base64.b64encode(f"{username}:{password}".encode()).decode()
+            sanitized = sanitized.replace(b64_creds, "***b64***")
+        except Exception:
+            pass
+        try:
+            b64_pass = base64.b64encode(password.encode()).decode()
+            sanitized = sanitized.replace(b64_pass, "***b64***")
+        except Exception:
+            pass
+    return sanitized
+
+
+_g_password = ""
+_g_username = ""
+
+
+def safe(text: str) -> str:
+    """Shorthand: sanitize text using the globally-registered credentials."""
+    return sanitize(text, _g_password, _g_username)
+
+
+# =============================================================================
+# HTTP Status Code Descriptions
+# =============================================================================
+
+HTTP_STATUS_DESCRIPTIONS = {
+    400: "Bad Request - the server could not understand the request",
+    401: "Unauthorized - authentication failed (check username and permissions)",
+    403: "Forbidden - user does not have sufficient permissions",
+    404: "Not Found - the requested resource does not exist",
+    405: "Method Not Allowed",
+    406: "Not Acceptable - invalid content type requested",
+    408: "Request Timeout - the server did not respond in time",
+    413: "Payload Too Large",
+    429: "Too Many Requests - rate limit exceeded",
+    500: "Internal Server Error - RabbitMQ encountered an unexpected condition",
+    502: "Bad Gateway - upstream server error",
+    503: "Service Unavailable - RabbitMQ is starting up, shutting down, or overloaded",
+    504: "Gateway Timeout",
+}
+
+
+def describe_http_error(status: int, path: str, body: Any = None) -> str:
+    """Build a human-readable error message for an HTTP error response."""
+    desc = HTTP_STATUS_DESCRIPTIONS.get(status, f"HTTP {status}")
+    msg = f"Management API {path} returned {status} ({desc})"
+    if isinstance(body, dict):
+        reason = body.get("reason") or body.get("error") or body.get("message")
+        if reason:
+            msg += f": {safe(str(reason))}"
+    elif isinstance(body, str) and body.strip():
+        short = body.strip()[:200]
+        if "<html" not in short.lower():
+            msg += f": {safe(short)}"
+    return msg
+
+
+# =============================================================================
 # AMQP 0-9-1 Constants
 # =============================================================================
 AMQP_PROTOCOL_HEADER = b"AMQP\x00\x00\x09\x01"
 
-# Frame types
 FRAME_METHOD = 1
 FRAME_HEADER = 2
 FRAME_BODY = 3
 FRAME_HEARTBEAT = 8
-
 FRAME_END = 0xCE
 
-# Class IDs
+FRAME_TYPE_NAMES = {
+    FRAME_METHOD: "METHOD",
+    FRAME_HEADER: "HEADER",
+    FRAME_BODY: "BODY",
+    FRAME_HEARTBEAT: "HEARTBEAT",
+}
+
 CLASS_CONNECTION = 10
 CLASS_CHANNEL = 20
 CLASS_EXCHANGE = 40
 CLASS_QUEUE = 50
 CLASS_BASIC = 60
 
-# Method IDs
 METHOD_CONNECTION_START = (10, 10)
 METHOD_CONNECTION_START_OK = (10, 11)
 METHOD_CONNECTION_TUNE = (10, 30)
@@ -90,6 +179,34 @@ METHOD_BASIC_GET_OK = (60, 71)
 METHOD_BASIC_GET_EMPTY = (60, 72)
 METHOD_BASIC_ACK = (60, 80)
 
+METHOD_NAMES = {
+    (10, 10): "Connection.Start",
+    (10, 11): "Connection.Start-OK",
+    (10, 30): "Connection.Tune",
+    (10, 31): "Connection.Tune-OK",
+    (10, 40): "Connection.Open",
+    (10, 41): "Connection.Open-OK",
+    (10, 50): "Connection.Close",
+    (10, 51): "Connection.Close-OK",
+    (20, 10): "Channel.Open",
+    (20, 11): "Channel.Open-OK",
+    (20, 40): "Channel.Close",
+    (20, 41): "Channel.Close-OK",
+    (50, 10): "Queue.Declare",
+    (50, 11): "Queue.Declare-OK",
+    (50, 40): "Queue.Delete",
+    (50, 41): "Queue.Delete-OK",
+    (60, 40): "Basic.Publish",
+    (60, 70): "Basic.Get",
+    (60, 71): "Basic.Get-OK",
+    (60, 72): "Basic.Get-Empty",
+    (60, 80): "Basic.Ack",
+}
+
+
+def method_name(class_id: int, method_id: int) -> str:
+    return METHOD_NAMES.get((class_id, method_id), f"({class_id},{method_id})")
+
 
 class AMQPError(Exception):
     """AMQP protocol error."""
@@ -99,7 +216,7 @@ class AMQPError(Exception):
 class AMQPClient:
     """
     Minimal AMQP 0-9-1 client using raw sockets.
-    Supports just enough to: connect, declare quorum queue, publish, get, ack, delete, close.
+    Supports: connect, declare quorum queue, publish, get, ack, delete, close.
     """
 
     def __init__(
@@ -132,190 +249,187 @@ class AMQPClient:
         self.frame_max = 131072
         self._connected = False
 
-    # ---- low-level I/O ----
-
     def connect(self) -> None:
+        proto = "amqps" if self.use_ssl else "amqp"
+        debug(f"AMQP connecting to {proto}://{self.host}:{self.port}/{self.vhost} as user '{self.username}'")
+
         raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw.settimeout(self.timeout)
+        debug(f"Socket created, timeout={self.timeout}s")
 
         if self.use_ssl:
+            debug("TLS: setting up SSL context")
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             if self.ssl_no_verify:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
+                debug("TLS: certificate verification DISABLED (--ssl-no-verify)")
             else:
                 ctx.verify_mode = ssl.CERT_REQUIRED
                 ctx.check_hostname = True
+                debug("TLS: certificate verification enabled")
             if self.ssl_ca_cert:
                 ctx.load_verify_locations(self.ssl_ca_cert)
+                debug(f"TLS: loaded CA cert from {self.ssl_ca_cert}")
             else:
                 ctx.load_default_certs()
+                debug("TLS: using system default CA certificates")
             if self.ssl_cert and self.ssl_key:
                 ctx.load_cert_chain(self.ssl_cert, self.ssl_key)
+                debug(f"TLS: loaded client cert={self.ssl_cert}, key={self.ssl_key}")
             self.sock = ctx.wrap_socket(raw, server_hostname=self.host)
+            debug("TLS: handshake complete")
         else:
             self.sock = raw
 
         self.sock.connect((self.host, self.port))
+        debug(f"TCP connected to {self.host}:{self.port}")
 
-        # Send protocol header
         self.sock.sendall(AMQP_PROTOCOL_HEADER)
+        debug("Sent AMQP 0-9-1 protocol header")
 
-        # Receive Connection.Start
-        class_id, method_id, payload = self._read_method(0)
-        if (class_id, method_id) != METHOD_CONNECTION_START:
-            raise AMQPError(f"Expected Connection.Start, got ({class_id},{method_id})")
+        class_id, mid, payload = self._read_method(0)
+        if (class_id, mid) != METHOD_CONNECTION_START:
+            raise AMQPError(f"Expected Connection.Start, got {method_name(class_id, mid)}")
+        debug("Received Connection.Start from server")
 
-        # Send Connection.Start-OK
         self._send_connection_start_ok()
+        debug("Sent Connection.Start-OK (PLAIN auth)")
 
-        # Receive Connection.Tune
-        class_id, method_id, payload = self._read_method(0)
-        if (class_id, method_id) != METHOD_CONNECTION_TUNE:
-            raise AMQPError(f"Expected Connection.Tune, got ({class_id},{method_id})")
-        # Parse tune params
+        class_id, mid, payload = self._read_method(0)
+        if (class_id, mid) != METHOD_CONNECTION_TUNE:
+            raise AMQPError(f"Expected Connection.Tune, got {method_name(class_id, mid)}")
         chan_max, frame_max, heartbeat = struct.unpack("!HIH", payload)
         self.frame_max = frame_max if frame_max > 0 else 131072
+        debug(f"Received Connection.Tune: channel_max={chan_max}, frame_max={self.frame_max}, heartbeat={heartbeat}")
 
-        # Send Connection.Tune-OK (accept server values, heartbeat=0)
         tune_ok_payload = struct.pack("!HIH", chan_max, self.frame_max, 0)
         self._send_method(0, CLASS_CONNECTION, 31, tune_ok_payload)
+        debug("Sent Connection.Tune-OK (heartbeat=0)")
 
-        # Send Connection.Open
         vhost_encoded = self._encode_short_string(self.vhost)
-        # reserved-1 (short string), reserved-2 (bit)
         open_payload = vhost_encoded + b"\x00\x00"
         self._send_method(0, CLASS_CONNECTION, 40, open_payload)
+        debug(f"Sent Connection.Open for vhost '{self.vhost}'")
 
-        # Receive Connection.Open-OK
-        class_id, method_id, payload = self._read_method(0)
-        if (class_id, method_id) != METHOD_CONNECTION_OPEN_OK:
-            raise AMQPError(f"Expected Connection.Open-OK, got ({class_id},{method_id})")
-
+        class_id, mid, payload = self._read_method(0)
+        if (class_id, mid) != METHOD_CONNECTION_OPEN_OK:
+            raise AMQPError(f"Expected Connection.Open-OK, got {method_name(class_id, mid)}")
+        debug("Received Connection.Open-OK - AMQP connection established")
         self._connected = True
 
     def open_channel(self) -> None:
-        # Channel.Open
+        debug(f"Opening AMQP channel {self.channel_id}")
         payload = self._encode_short_string("")
         self._send_method(self.channel_id, CLASS_CHANNEL, 10, payload)
-
-        class_id, method_id, payload = self._read_method(self.channel_id)
-        if (class_id, method_id) != METHOD_CHANNEL_OPEN_OK:
-            raise AMQPError(f"Expected Channel.Open-OK, got ({class_id},{method_id})")
+        class_id, mid, payload = self._read_method(self.channel_id)
+        if (class_id, mid) != METHOD_CHANNEL_OPEN_OK:
+            raise AMQPError(f"Expected Channel.Open-OK, got {method_name(class_id, mid)}")
+        debug(f"Channel {self.channel_id} opened")
 
     def declare_quorum_queue(self, queue_name: str) -> Tuple[str, int, int]:
         """Declare a quorum queue. Returns (queue_name, message_count, consumer_count)."""
+        debug(f"Declaring quorum queue '{queue_name}' (durable=true, x-queue-type=quorum)")
         payload = bytearray()
-        # reserved-1 (short)
         payload += struct.pack("!H", 0)
-        # queue name
         payload += self._encode_short_string(queue_name)
-        # bits: passive=0, durable=1, exclusive=0, auto-delete=0, no-wait=0
         bits = 0
         bits |= (1 << 1)  # durable
         payload += struct.pack("B", bits)
-        # arguments table (x-queue-type = quorum)
         args_table = self._encode_table({"x-queue-type": "quorum"})
         payload += args_table
-
         self._send_method(self.channel_id, CLASS_QUEUE, 10, bytes(payload))
-
-        class_id, method_id, resp = self._read_method(self.channel_id)
-        if (class_id, method_id) != METHOD_QUEUE_DECLARE_OK:
-            raise AMQPError(f"Expected Queue.Declare-OK, got ({class_id},{method_id})")
-
+        class_id, mid, resp = self._read_method(self.channel_id)
+        if (class_id, mid) != METHOD_QUEUE_DECLARE_OK:
+            raise AMQPError(f"Expected Queue.Declare-OK, got {method_name(class_id, mid)}")
         name, offset = self._decode_short_string(resp, 0)
         msg_count, consumer_count = struct.unpack_from("!II", resp, offset)
+        debug(f"Queue.Declare-OK: name='{name}', messages={msg_count}, consumers={consumer_count}")
+        return name, msg_count, consumer_count
+
+    def declare_queue_passive(self, queue_name: str) -> Tuple[str, int, int]:
+        """Passively declare a queue (check existence). Raises AMQPError if not found."""
+        debug(f"Passively declaring queue '{queue_name}' (passive=true)")
+        payload = bytearray()
+        payload += struct.pack("!H", 0)
+        payload += self._encode_short_string(queue_name)
+        bits = (1 << 0)  # passive
+        payload += struct.pack("B", bits)
+        payload += self._encode_table({})
+        self._send_method(self.channel_id, CLASS_QUEUE, 10, bytes(payload))
+        class_id, mid, resp = self._read_method(self.channel_id)
+        if (class_id, mid) != METHOD_QUEUE_DECLARE_OK:
+            raise AMQPError(f"Expected Queue.Declare-OK, got {method_name(class_id, mid)}")
+        name, offset = self._decode_short_string(resp, 0)
+        msg_count, consumer_count = struct.unpack_from("!II", resp, offset)
+        debug(f"Queue.Declare-OK (passive): name='{name}', messages={msg_count}, consumers={consumer_count}")
         return name, msg_count, consumer_count
 
     def delete_queue(self, queue_name: str) -> int:
         """Delete a queue. Returns message count."""
+        debug(f"Deleting queue '{queue_name}'")
         payload = bytearray()
-        payload += struct.pack("!H", 0)  # reserved-1
+        payload += struct.pack("!H", 0)
         payload += self._encode_short_string(queue_name)
-        # bits: if-unused=0, if-empty=0, no-wait=0
         payload += struct.pack("B", 0)
-
         self._send_method(self.channel_id, CLASS_QUEUE, 40, bytes(payload))
-
-        class_id, method_id, resp = self._read_method(self.channel_id)
-        if (class_id, method_id) != METHOD_QUEUE_DELETE_OK:
-            raise AMQPError(f"Expected Queue.Delete-OK, got ({class_id},{method_id})")
-
+        class_id, mid, resp = self._read_method(self.channel_id)
+        if (class_id, mid) != METHOD_QUEUE_DELETE_OK:
+            raise AMQPError(f"Expected Queue.Delete-OK, got {method_name(class_id, mid)}")
         msg_count = struct.unpack_from("!I", resp, 0)[0]
+        debug(f"Queue.Delete-OK: '{queue_name}' deleted, {msg_count} messages purged")
         return msg_count
 
-    def basic_publish(
-        self, exchange: str, routing_key: str, body: bytes, properties: Optional[Dict] = None
-    ) -> None:
-        """Publish a message to the default exchange with the given routing key."""
-        # Basic.Publish method frame
+    def basic_publish(self, exchange: str, routing_key: str, body: bytes,
+                      properties: Optional[Dict] = None) -> None:
+        """Publish a message."""
         payload = bytearray()
-        payload += struct.pack("!H", 0)  # reserved-1
+        payload += struct.pack("!H", 0)
         payload += self._encode_short_string(exchange)
         payload += self._encode_short_string(routing_key)
-        # bits: mandatory=0, immediate=0
         payload += struct.pack("B", 0)
         self._send_method(self.channel_id, CLASS_BASIC, 40, bytes(payload))
 
-        # Content header frame
         body_size = len(body)
-        # class-id=60 (basic), weight=0, body-size, property-flags, properties
-        # AMQP 0-9-1 Basic property flags (bit 15 = MSB):
-        #   bit 15 = content-type, 14 = content-encoding, 13 = headers,
-        #   bit 12 = delivery-mode, 11 = priority, ...
-        # We set delivery-mode = 2 (persistent) for quorum queue durability.
         prop_flags = 0
         prop_payload = bytearray()
         prop_flags |= (1 << 12)  # delivery-mode present
-        prop_payload += struct.pack("B", 2)  # delivery-mode = persistent
+        prop_payload += struct.pack("B", 2)  # persistent
 
         header = struct.pack("!HHQ", 60, 0, body_size)
         header += struct.pack("!H", prop_flags)
         header += bytes(prop_payload)
-
         self._send_frame(FRAME_HEADER, self.channel_id, header)
 
-        # Body frame(s)
-        max_body = self.frame_max - 8  # frame overhead
+        max_body = self.frame_max - 8
         offset = 0
         while offset < len(body):
-            chunk = body[offset : offset + max_body]
+            chunk = body[offset:offset + max_body]
             self._send_frame(FRAME_BODY, self.channel_id, chunk)
             offset += len(chunk)
 
     def basic_get(self, queue_name: str) -> Optional[Tuple[int, bytes]]:
-        """
-        Get a single message from queue (synchronous).
-        Returns (delivery_tag, body) or None if empty.
-        """
+        """Get a single message. Returns (delivery_tag, body) or None."""
         payload = bytearray()
-        payload += struct.pack("!H", 0)  # reserved-1
+        payload += struct.pack("!H", 0)
         payload += self._encode_short_string(queue_name)
         payload += struct.pack("B", 0)  # no-ack = false
         self._send_method(self.channel_id, CLASS_BASIC, 70, bytes(payload))
 
-        class_id, method_id, resp = self._read_method(self.channel_id)
+        class_id, mid, resp = self._read_method(self.channel_id)
 
-        if (class_id, method_id) == METHOD_BASIC_GET_EMPTY:
+        if (class_id, mid) == METHOD_BASIC_GET_EMPTY:
             return None
+        if (class_id, mid) != METHOD_BASIC_GET_OK:
+            raise AMQPError(f"Expected Basic.Get-OK or Get-Empty, got {method_name(class_id, mid)}")
 
-        if (class_id, method_id) != METHOD_BASIC_GET_OK:
-            raise AMQPError(f"Expected Basic.Get-OK or Get-Empty, got ({class_id},{method_id})")
-
-        # Parse delivery tag from Get-OK
         delivery_tag = struct.unpack_from("!Q", resp, 0)[0]
 
-        # Read content header
         frame_type, channel, header_payload = self._read_frame()
         if frame_type != FRAME_HEADER:
             raise AMQPError(f"Expected content header, got frame type {frame_type}")
-
-        # Parse body size from header
-        # class-id (2) + weight (2) + body-size (8) + property-flags (2+)
         body_size = struct.unpack_from("!Q", header_payload, 4)[0]
 
-        # Read body frames
         body = bytearray()
         while len(body) < body_size:
             frame_type, channel, body_chunk = self._read_frame()
@@ -326,33 +440,31 @@ class AMQPClient:
         return delivery_tag, bytes(body)
 
     def basic_ack(self, delivery_tag: int) -> None:
-        payload = struct.pack("!QB", delivery_tag, 0)  # multiple=false
+        payload = struct.pack("!QB", delivery_tag, 0)
         self._send_method(self.channel_id, CLASS_BASIC, 80, payload)
 
     def close_channel(self) -> None:
         try:
-            # Channel.Close
-            payload = struct.pack("!HHH", 200, 0, 0)
+            debug(f"Closing AMQP channel {self.channel_id}")
             payload = struct.pack("!H", 200) + self._encode_short_string("Normal shutdown") + struct.pack("!HH", 0, 0)
             self._send_method(self.channel_id, CLASS_CHANNEL, 40, payload)
-
-            class_id, method_id, _ = self._read_method(self.channel_id)
-            # Accept close-ok
-        except Exception:
-            pass
+            self._read_method(self.channel_id)
+            debug(f"Channel {self.channel_id} closed")
+        except Exception as e:
+            debug(f"Channel close error (non-fatal): {safe(str(e))}")
 
     def close_connection(self) -> None:
         try:
+            debug("Closing AMQP connection")
             payload = struct.pack("!H", 200) + self._encode_short_string("Normal shutdown") + struct.pack("!HH", 0, 0)
             self._send_method(0, CLASS_CONNECTION, 50, payload)
-
-            # Read Connection.Close-OK
             try:
                 self._read_method(0)
+                debug("Connection.Close-OK received")
             except Exception:
                 pass
-        except Exception:
-            pass
+        except Exception as e:
+            debug(f"Connection close error (non-fatal): {safe(str(e))}")
         finally:
             if self.sock:
                 try:
@@ -361,6 +473,7 @@ class AMQPClient:
                     pass
                 self.sock = None
             self._connected = False
+            debug("AMQP connection closed")
 
     def close(self) -> None:
         if self._connected:
@@ -386,7 +499,7 @@ class AMQPClient:
     def _decode_short_string(data: bytes, offset: int) -> Tuple[str, int]:
         length = data[offset]
         offset += 1
-        s = data[offset : offset + length].decode("utf-8")
+        s = data[offset:offset + length].decode("utf-8")
         return s, offset + length
 
     @staticmethod
@@ -396,7 +509,6 @@ class AMQPClient:
 
     @staticmethod
     def _encode_table(d: Dict[str, Any]) -> bytes:
-        """Encode an AMQP field table."""
         buf = bytearray()
         for key, value in d.items():
             key_bytes = key.encode("utf-8")
@@ -427,62 +539,52 @@ class AMQPClient:
         return bytes(data)
 
     def _read_frame(self) -> Tuple[int, int, bytes]:
-        """Read a single AMQP frame. Returns (frame_type, channel, payload)."""
         header = self._read_exact(7)
         frame_type, channel, size = struct.unpack("!BHI", header)
-
         payload = self._read_exact(size) if size > 0 else b""
         end = self._read_exact(1)
         if end[0] != FRAME_END:
             raise AMQPError(f"Invalid frame end marker: 0x{end[0]:02x}")
-
+        frame_name = FRAME_TYPE_NAMES.get(frame_type, f"UNKNOWN({frame_type})")
+        if frame_type == FRAME_METHOD and size >= 4:
+            cid, mid_val = struct.unpack_from("!HH", payload, 0)
+            debug(f"  << Frame: {frame_name} ch={channel} {method_name(cid, mid_val)} ({size} bytes)")
+        elif frame_type != FRAME_BODY:
+            debug(f"  << Frame: {frame_name} ch={channel} ({size} bytes)")
         return frame_type, channel, payload
 
     def _read_method(self, expected_channel: int) -> Tuple[int, int, bytes]:
-        """Read frames until we get a method frame on the expected channel."""
         while True:
             frame_type, channel, payload = self._read_frame()
-
             if frame_type == FRAME_HEARTBEAT:
-                # Respond to heartbeat
+                debug("Heartbeat received, sending heartbeat response")
                 self._send_frame(FRAME_HEARTBEAT, 0, b"")
                 continue
-
             if frame_type == FRAME_METHOD:
                 if channel != expected_channel:
-                    # Check for connection-level error
                     if channel == 0:
-                        class_id, method_id = struct.unpack_from("!HH", payload, 0)
-                        if (class_id, method_id) == METHOD_CONNECTION_CLOSE:
+                        class_id, mid_val = struct.unpack_from("!HH", payload, 0)
+                        if (class_id, mid_val) == METHOD_CONNECTION_CLOSE:
                             reply_code = struct.unpack_from("!H", payload, 4)[0]
                             reply_text, _ = self._decode_short_string(payload, 6)
-                            raise AMQPError(
-                                f"Server closed connection: {reply_code} - {reply_text}"
-                            )
+                            debug(f"Server forced connection close: {reply_code} - {safe(reply_text)}")
+                            raise AMQPError(f"Server closed connection: {reply_code} - {safe(reply_text)}")
                     continue
-
-                class_id, method_id = struct.unpack_from("!HH", payload, 0)
+                class_id, mid_val = struct.unpack_from("!HH", payload, 0)
                 method_payload = payload[4:]
-
-                # Check for channel/connection close (error)
-                if (class_id, method_id) == METHOD_CHANNEL_CLOSE:
+                if (class_id, mid_val) == METHOD_CHANNEL_CLOSE:
                     reply_code = struct.unpack_from("!H", method_payload, 0)[0]
                     reply_text, _ = self._decode_short_string(method_payload, 2)
-                    # Send Channel.Close-OK
+                    debug(f"Server closed channel: {reply_code} - {safe(reply_text)}")
                     self._send_method(channel, CLASS_CHANNEL, 41, b"")
-                    raise AMQPError(
-                        f"Channel closed by server: {reply_code} - {reply_text}"
-                    )
-                if (class_id, method_id) == METHOD_CONNECTION_CLOSE:
+                    raise AMQPError(f"Channel closed by server: {reply_code} - {safe(reply_text)}")
+                if (class_id, mid_val) == METHOD_CONNECTION_CLOSE:
                     reply_code = struct.unpack_from("!H", method_payload, 0)[0]
                     reply_text, _ = self._decode_short_string(method_payload, 2)
-                    # Send Connection.Close-OK
+                    debug(f"Server closed connection: {reply_code} - {safe(reply_text)}")
                     self._send_method(0, CLASS_CONNECTION, 51, b"")
-                    raise AMQPError(
-                        f"Connection closed by server: {reply_code} - {reply_text}"
-                    )
-
-                return class_id, method_id, method_payload
+                    raise AMQPError(f"Connection closed by server: {reply_code} - {safe(reply_text)}")
+                return class_id, mid_val, method_payload
 
     def _send_frame(self, frame_type: int, channel: int, payload: bytes) -> None:
         frame = struct.pack("!BHI", frame_type, channel, len(payload))
@@ -490,29 +592,22 @@ class AMQPClient:
         frame += struct.pack("B", FRAME_END)
         self.sock.sendall(frame)
 
-    def _send_method(self, channel: int, class_id: int, method_id: int, payload: bytes) -> None:
-        method_payload = struct.pack("!HH", class_id, method_id) + payload
+    def _send_method(self, channel: int, class_id: int, method_id_val: int, payload: bytes) -> None:
+        method_payload = struct.pack("!HH", class_id, method_id_val) + payload
+        debug(f"  >> Sending {method_name(class_id, method_id_val)} on ch={channel} ({len(payload)} bytes)")
         self._send_frame(FRAME_METHOD, channel, method_payload)
 
     def _send_connection_start_ok(self) -> None:
-        """Send Connection.Start-OK with PLAIN auth."""
-        # Client properties table
-        client_props = self._encode_table(
-            {
-                "product": "check_rabbitmq",
-                "version": "1.0.0",
-                "platform": "Python",
-                "information": "Nagios/Icinga2 check plugin",
-            }
-        )
-        # Mechanism
+        client_props = self._encode_table({
+            "product": "check_rabbitmq",
+            "version": VERSION,
+            "platform": "Python",
+            "information": "Nagios/Icinga2 check plugin",
+        })
         mechanism = self._encode_short_string("PLAIN")
-        # Response (PLAIN: \0username\0password)
         auth_response = b"\x00" + self.username.encode("utf-8") + b"\x00" + self.password.encode("utf-8")
         response = struct.pack("!I", len(auth_response)) + auth_response
-        # Locale
         locale = self._encode_short_string("en_US")
-
         payload = client_props + mechanism + response + locale
         self._send_method(0, CLASS_CONNECTION, 11, payload)
 
@@ -524,17 +619,9 @@ class AMQPClient:
 class ManagementAPIClient:
     """Client for RabbitMQ Management HTTP API using only stdlib."""
 
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        username: str,
-        password: str,
-        use_ssl: bool = False,
-        ssl_ca_cert: Optional[str] = None,
-        ssl_no_verify: bool = False,
-        timeout: int = 10,
-    ):
+    def __init__(self, host: str, port: int, username: str, password: str,
+                 use_ssl: bool = False, ssl_ca_cert: Optional[str] = None,
+                 ssl_no_verify: bool = False, timeout: int = 10):
         self.host = host
         self.port = port
         self.username = username
@@ -545,45 +632,48 @@ class ManagementAPIClient:
         self.timeout = timeout
 
     def _get_connection(self) -> http.client.HTTPConnection:
+        scheme = "https" if self.use_ssl else "http"
+        debug(f"HTTP: creating {scheme} connection to {self.host}:{self.port}")
         if self.use_ssl:
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             if self.ssl_no_verify:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
+                debug("HTTP TLS: certificate verification DISABLED")
             else:
                 ctx.verify_mode = ssl.CERT_REQUIRED
                 ctx.check_hostname = True
                 if self.ssl_ca_cert:
                     ctx.load_verify_locations(self.ssl_ca_cert)
+                    debug(f"HTTP TLS: loaded CA cert from {self.ssl_ca_cert}")
                 else:
                     ctx.load_default_certs()
-            return http.client.HTTPSConnection(
-                self.host, self.port, timeout=self.timeout, context=ctx
-            )
+                    debug("HTTP TLS: using system default CA certificates")
+            return http.client.HTTPSConnection(self.host, self.port, timeout=self.timeout, context=ctx)
         else:
-            return http.client.HTTPConnection(
-                self.host, self.port, timeout=self.timeout
-            )
+            return http.client.HTTPConnection(self.host, self.port, timeout=self.timeout)
 
     def _auth_header(self) -> str:
-        creds = base64.b64encode(
-            f"{self.username}:{self.password}".encode()
-        ).decode()
+        creds = base64.b64encode(f"{self.username}:{self.password}".encode()).decode()
         return f"Basic {creds}"
 
     def _request(self, method: str, path: str, body: Optional[str] = None) -> Tuple[int, Any]:
         conn = self._get_connection()
-        headers = {
-            "Authorization": self._auth_header(),
-            "Content-Type": "application/json",
-        }
+        headers = {"Authorization": self._auth_header(), "Content-Type": "application/json"}
+        full_path = f"/api{path}"
+        debug(f"HTTP {method} {full_path}")
+        status = 0
         try:
-            conn.request(method, f"/api{path}", body=body, headers=headers)
+            conn.request(method, full_path, body=body, headers=headers)
             resp = conn.getresponse()
             data = resp.read().decode("utf-8")
             status = resp.status
+            debug(f"HTTP response: {status} ({len(data)} bytes)")
             if data and resp.getheader("Content-Type", "").startswith("application/json"):
                 return status, json.loads(data)
+            return status, data
+        except json.JSONDecodeError as e:
+            debug(f"HTTP response JSON parse error: {e}")
             return status, data
         finally:
             conn.close()
@@ -592,58 +682,63 @@ class ManagementAPIClient:
         return self._request("GET", path)
 
     def get_overview(self) -> Dict:
+        debug("Fetching cluster overview via Management API")
         status, data = self.get("/overview")
         if status != 200:
-            raise Exception(f"Management API /overview returned HTTP {status}")
+            raise Exception(describe_http_error(status, "/overview", data))
+        debug(f"Overview: cluster={data.get('cluster_name', '?')}, rmq={data.get('rabbitmq_version', '?')}")
         return data
 
     def get_nodes(self) -> List[Dict]:
+        debug("Fetching node list via Management API")
         status, data = self.get("/nodes")
         if status != 200:
-            raise Exception(f"Management API /nodes returned HTTP {status}")
+            raise Exception(describe_http_error(status, "/nodes", data))
+        debug(f"Found {len(data)} node(s)")
         return data
 
     def get_health_checks(self) -> Dict:
-        """Aggregate multiple health check endpoints."""
         results = {}
-        for endpoint in [
-            "/health/checks/alarms",
-            "/health/checks/local-alarms",
-        ]:
+        for endpoint in ["/health/checks/alarms", "/health/checks/local-alarms"]:
             try:
+                debug(f"Checking health endpoint: {endpoint}")
                 status, data = self.get(endpoint)
                 results[endpoint] = {"status": status, "data": data}
+                debug(f"Health check {endpoint}: {'OK' if status == 200 else f'HTTP {status}'}")
             except Exception as e:
+                debug(f"Health check {endpoint}: error - {safe(str(e))}")
                 results[endpoint] = {"status": -1, "error": str(e)}
         return results
 
     def get_queues(self, vhost: Optional[str] = None) -> List[Dict]:
-        if vhost:
-            path = f"/queues/{urllib.parse.quote(vhost, safe='')}"
-        else:
-            path = "/queues"
+        path = f"/queues/{urllib.parse.quote(vhost, safe='')}" if vhost else "/queues"
+        debug(f"Listing queues: {path}")
         status, data = self.get(path)
         if status != 200:
-            raise Exception(f"Management API {path} returned HTTP {status}")
+            raise Exception(describe_http_error(status, path, data))
+        debug(f"Found {len(data)} queue(s)")
         return data
 
     def get_exchanges(self, vhost: Optional[str] = None) -> List[Dict]:
-        if vhost:
-            path = f"/exchanges/{urllib.parse.quote(vhost, safe='')}"
-        else:
-            path = "/exchanges"
+        path = f"/exchanges/{urllib.parse.quote(vhost, safe='')}" if vhost else "/exchanges"
+        debug(f"Listing exchanges: {path}")
         status, data = self.get(path)
         if status != 200:
-            raise Exception(f"Management API {path} returned HTTP {status}")
+            raise Exception(describe_http_error(status, path, data))
+        debug(f"Found {len(data)} exchange(s)")
         return data
 
     def get_queue(self, vhost: str, queue_name: str) -> Optional[Dict]:
         path = f"/queues/{urllib.parse.quote(vhost, safe='')}/{urllib.parse.quote(queue_name, safe='')}"
+        debug(f"Fetching queue details: {path}")
         status, data = self.get(path)
         if status == 404:
+            debug(f"Queue '{queue_name}' not found (HTTP 404)")
             return None
         if status != 200:
-            raise Exception(f"Management API {path} returned HTTP {status}")
+            raise Exception(describe_http_error(status, path, data))
+        debug(f"Queue '{queue_name}': state={data.get('state', '?')}, type={data.get('type', '?')}, "
+              f"messages={data.get('messages', 0)}")
         return data
 
     def get_cluster_name(self) -> str:
@@ -654,207 +749,397 @@ class ManagementAPIClient:
 
 
 # =============================================================================
+# Duration parsing helper
+# =============================================================================
+
+def parse_duration(value: str) -> float:
+    """
+    Parse a human-friendly duration string into seconds.
+    Supported formats: '30' (seconds), '30s', '5m', '1m30s', '90s'.
+    Returns float seconds.
+    """
+    if not value:
+        raise ValueError("Empty duration string")
+
+    # Pure numeric = seconds
+    try:
+        return float(value)
+    except ValueError:
+        pass
+
+    value = value.strip().lower()
+    total = 0.0
+    # Match patterns like 1m, 30s, 1m30s, 2m15s
+    pattern = re.compile(r"(\d+(?:\.\d+)?)\s*([msh]?)")
+    pos = 0
+    found_any = False
+    for match in pattern.finditer(value):
+        if match.start() != pos:
+            raise ValueError(f"Invalid duration format: '{value}'")
+        num = float(match.group(1))
+        unit = match.group(2)
+        if unit == "m":
+            total += num * 60
+        elif unit == "h":
+            total += num * 3600
+        elif unit == "s" or unit == "":
+            total += num
+        else:
+            raise ValueError(f"Unknown duration unit: '{unit}'")
+        pos = match.end()
+        found_any = True
+
+    if not found_any or pos != len(value):
+        raise ValueError(f"Invalid duration format: '{value}'")
+    return total
+
+
+# =============================================================================
 # Check Mode Implementations
 # =============================================================================
 
 def check_publish_consume(args: argparse.Namespace) -> Tuple[int, str, str]:
     """
     Mode: publish_consume
-    Creates a quorum queue, publishes a message, consumes it back, verifies, cleans up.
+    Publishes message(s) to a queue, consumes them back, verifies content.
+
+    Volume control (mutually exclusive, default is 1 message):
+      --message-count N     publish exactly N messages
+      --publish-duration D  publish continuously for D seconds (e.g. '20s', '1m')
+
+    Queue lifecycle:
+      --queue-name NAME     re-use an existing queue (or create if absent)
+      --no-delete           keep the queue after the test
     """
-    queue_name = f"icinga2_check_{uuid.uuid4().hex[:12]}"
-    test_message = f"check_rabbitmq_test_{uuid.uuid4().hex}"
+    # ---- determine queue name ----
+    if args.queue_name:
+        queue_name = args.queue_name
+        queue_is_user_provided = True
+        debug(f"Using user-specified queue name: '{queue_name}'")
+    else:
+        queue_name = f"icinga2_check_{uuid.uuid4().hex[:12]}"
+        queue_is_user_provided = False
+        debug(f"Generated temporary queue name: '{queue_name}'")
+
+    should_delete = not args.no_delete
+    if args.no_delete:
+        debug("--no-delete is set: queue will NOT be deleted after the check")
+
+    # ---- determine volume ----
+    message_count = args.message_count  # int or None
+    publish_duration = None             # float seconds or None
+    if args.publish_duration:
+        try:
+            publish_duration = parse_duration(args.publish_duration)
+        except ValueError as e:
+            return (STATE_UNKNOWN, f"UNKNOWN - Invalid --publish-duration value: {e}", "")
+        debug(f"Publish duration mode: will publish for {publish_duration:.1f}s")
+    elif message_count is not None:
+        if message_count < 1:
+            return (STATE_UNKNOWN, "UNKNOWN - --message-count must be >= 1", "")
+        debug(f"Message count mode: will publish {message_count} messages")
+    else:
+        message_count = 1
+        debug("Default mode: 1 message")
+
+    # ---- unique run ID to tag messages ----
+    run_id = uuid.uuid4().hex[:16]
+
     client = None
-    perfdata_parts = []
+    queue_was_created = False
+    queue_existed_before = False
 
     try:
         t_start = time.monotonic()
 
         client = AMQPClient(
-            host=args.host,
-            port=args.amqp_port,
-            vhost=args.vhost,
-            username=args.username,
-            password=args.password,
-            use_ssl=args.amqps,
-            ssl_ca_cert=args.ssl_ca_cert,
-            ssl_cert=args.ssl_cert,
-            ssl_key=args.ssl_key,
-            ssl_no_verify=args.ssl_no_verify,
-            timeout=args.timeout,
+            host=args.host, port=args.amqp_port, vhost=args.vhost,
+            username=args.username, password=args.password,
+            use_ssl=args.amqps, ssl_ca_cert=args.ssl_ca_cert,
+            ssl_cert=args.ssl_cert, ssl_key=args.ssl_key,
+            ssl_no_verify=args.ssl_no_verify, timeout=args.timeout,
         )
         client.connect()
         t_connect = time.monotonic()
 
         client.open_channel()
 
-        # Declare quorum queue
-        declared_name, _, _ = client.declare_quorum_queue(queue_name)
+        # ---- declare / reuse queue ----
+        if queue_is_user_provided:
+            try:
+                debug(f"Checking if queue '{queue_name}' already exists (passive declare)")
+                _name, _mc, _cc = client.declare_queue_passive(queue_name)
+                debug(f"Queue '{queue_name}' exists: messages={_mc}, consumers={_cc}")
+                queue_existed_before = True
+            except AMQPError as e:
+                err_str = str(e)
+                if "NOT_FOUND" in err_str or "404" in err_str:
+                    debug(f"Queue '{queue_name}' does not exist, creating as quorum queue")
+                    client.open_channel()
+                    client.declare_quorum_queue(queue_name)
+                    queue_was_created = True
+                else:
+                    raise
+        else:
+            client.declare_quorum_queue(queue_name)
+            queue_was_created = True
+
         t_declare = time.monotonic()
 
-        # Publish
-        client.basic_publish(
-            exchange="",
-            routing_key=queue_name,
-            body=test_message.encode("utf-8"),
-        )
+        # ---- publish phase ----
+        published_tags: List[str] = []  # message identifiers for verification
+
+        if publish_duration is not None:
+            # Time-based publishing
+            debug(f"Publishing messages for {publish_duration:.1f}s")
+            deadline = time.monotonic() + publish_duration
+            seq = 0
+            while time.monotonic() < deadline:
+                tag = f"{run_id}:{seq}"
+                body = tag.encode("utf-8")
+                client.basic_publish(exchange="", routing_key=queue_name, body=body)
+                published_tags.append(tag)
+                seq += 1
+                if seq % 100 == 0:
+                    elapsed = time.monotonic() - (deadline - publish_duration)
+                    debug(f"  Published {seq} messages in {elapsed:.1f}s")
+            debug(f"Publish phase complete: {len(published_tags)} messages in {publish_duration:.1f}s")
+        else:
+            # Count-based publishing
+            debug(f"Publishing {message_count} message(s)")
+            for seq in range(message_count):
+                tag = f"{run_id}:{seq}"
+                body = tag.encode("utf-8")
+                client.basic_publish(exchange="", routing_key=queue_name, body=body)
+                published_tags.append(tag)
+                if (seq + 1) % 100 == 0:
+                    debug(f"  Published {seq + 1}/{message_count} messages")
+            debug(f"Publish phase complete: {len(published_tags)} messages")
+
+        total_published = len(published_tags)
         t_publish = time.monotonic()
 
-        # Brief pause for quorum replication
-        time.sleep(0.2)
+        # ---- consume phase ----
+        # Brief pause for quorum replication before first get
+        repl_wait = min(0.2 + total_published * 0.001, 2.0)  # scale with volume, cap at 2s
+        debug(f"Waiting {repl_wait:.1f}s for quorum replication")
+        time.sleep(repl_wait)
 
-        # Consume
-        result = client.basic_get(queue_name)
+        expected_set = set(published_tags)
+        received_set: set = set()
+        consume_errors = 0
+        max_consume_attempts = total_published + 10  # safety bound to avoid infinite loops
+        attempts = 0
+
+        debug(f"Consuming: expecting {total_published} messages")
+
+        while len(received_set) < total_published and attempts < max_consume_attempts:
+            result = client.basic_get(queue_name)
+            attempts += 1
+
+            if result is None:
+                # Queue empty but we haven't got all messages yet.
+                # Retry a few times with brief pauses.
+                if attempts < max_consume_attempts:
+                    time.sleep(0.1)
+                    continue
+                else:
+                    break
+
+            delivery_tag_val, body = result
+            client.basic_ack(delivery_tag_val)
+            received_tag = body.decode("utf-8")
+
+            if received_tag in expected_set:
+                received_set.add(received_tag)
+            else:
+                # Message from a previous run or unknown origin - not an error
+                # when reusing an existing queue. Just skip it.
+                debug(f"  Skipped foreign message (not from this run): {received_tag[:40]}")
+
+            if len(received_set) % 100 == 0 and len(received_set) > 0:
+                debug(f"  Consumed {len(received_set)}/{total_published} messages")
+
         t_consume = time.monotonic()
 
-        if result is None:
-            # Retry once after a short delay
-            time.sleep(0.5)
-            result = client.basic_get(queue_name)
-            t_consume = time.monotonic()
+        total_received = len(received_set)
+        missing = total_published - total_received
+        debug(f"Consume phase complete: received={total_received}/{total_published}, "
+              f"attempts={attempts}, missing={missing}")
 
-        if result is None:
-            client.delete_queue(queue_name)
+        if missing > 0:
+            debug(f"FAILED: {missing} message(s) not consumed back")
+            _cleanup_queue(client, queue_name, should_delete, queue_was_created, queue_existed_before)
             client.close()
+
+            perfdata = (
+                f"published={total_published};;;; "
+                f"consumed={total_received};;;; "
+                f"missing={missing};;;;"
+            )
             return (
                 STATE_CRITICAL,
-                "CRITICAL - Published message but could not consume it back",
-                "",
+                f"CRITICAL - Published {total_published} but only consumed {total_received} "
+                f"({missing} missing, queue: {queue_name})",
+                perfdata,
             )
 
-        delivery_tag, body = result
-        client.basic_ack(delivery_tag)
+        debug(f"All {total_published} messages verified successfully")
 
-        # Verify message content
-        received = body.decode("utf-8")
-        if received != test_message:
-            client.delete_queue(queue_name)
-            client.close()
-            return (
-                STATE_CRITICAL,
-                f"CRITICAL - Message content mismatch: expected '{test_message}', got '{received}'",
-                "",
-            )
-
-        # Cleanup
-        client.delete_queue(queue_name)
-        t_cleanup = time.monotonic()
+        # ---- cleanup ----
+        _cleanup_queue(client, queue_name, should_delete, queue_was_created, queue_existed_before)
 
         client.close()
         t_total = time.monotonic()
 
-        # Calculate timings
+        # ---- timings & perfdata ----
         connect_ms = (t_connect - t_start) * 1000
         declare_ms = (t_declare - t_connect) * 1000
         publish_ms = (t_publish - t_declare) * 1000
         consume_ms = (t_consume - t_publish) * 1000
         total_ms = (t_total - t_start) * 1000
 
+        # Rates
+        publish_elapsed = (t_publish - t_declare)
+        consume_elapsed = (t_consume - t_publish)
+        publish_rate = total_published / publish_elapsed if publish_elapsed > 0 else 0
+        consume_rate = total_received / consume_elapsed if consume_elapsed > 0 else 0
+
+        debug(f"Timings: connect={connect_ms:.1f}ms, declare={declare_ms:.1f}ms, "
+              f"publish={publish_ms:.1f}ms, consume={consume_ms:.1f}ms, total={total_ms:.1f}ms")
+        debug(f"Rates: publish={publish_rate:.1f} msg/s, consume={consume_rate:.1f} msg/s")
+
         perfdata = (
             f"connect_time={connect_ms:.1f}ms;;;; "
             f"declare_time={declare_ms:.1f}ms;;;; "
             f"publish_time={publish_ms:.1f}ms;;;; "
             f"consume_time={consume_ms:.1f}ms;;;; "
-            f"total_time={total_ms:.1f}ms"
+            f"total_time={total_ms:.1f}ms;;;; "
+            f"published={total_published};;;; "
+            f"consumed={total_received};;;; "
+            f"publish_rate={publish_rate:.1f};;;; "
+            f"consume_rate={consume_rate:.1f};;;;"
         )
 
-        # Apply thresholds on total_time
+        # ---- thresholds on total_time ----
         if args.critical and total_ms > args.critical:
             return (
                 STATE_CRITICAL,
-                f"CRITICAL - Publish/consume roundtrip took {total_ms:.1f}ms (threshold: {args.critical}ms)",
+                f"CRITICAL - Publish/consume roundtrip took {total_ms:.1f}ms "
+                f"({total_published} msgs, threshold: {args.critical}ms)",
                 perfdata,
             )
         if args.warning and total_ms > args.warning:
             return (
                 STATE_WARNING,
-                f"WARNING - Publish/consume roundtrip took {total_ms:.1f}ms (threshold: {args.warning}ms)",
+                f"WARNING - Publish/consume roundtrip took {total_ms:.1f}ms "
+                f"({total_published} msgs, threshold: {args.warning}ms)",
                 perfdata,
             )
 
+        # ---- success ----
         proto = "amqps" if args.amqps else "amqp"
+        queue_info = f"queue: {queue_name}"
+        if queue_existed_before:
+            queue_info += ", reused"
+        elif queue_was_created:
+            queue_info += ", created"
+        if not should_delete or queue_existed_before:
+            queue_info += ", kept"
+        else:
+            queue_info += ", deleted"
+
+        if total_published == 1:
+            summary = f"roundtrip in {total_ms:.1f}ms"
+        else:
+            summary = (
+                f"{total_published} msgs in {total_ms:.1f}ms "
+                f"(pub: {publish_rate:.0f} msg/s, con: {consume_rate:.0f} msg/s)"
+            )
+
         return (
             STATE_OK,
-            f"OK - Publish/consume roundtrip successful via {proto} in {total_ms:.1f}ms "
-            f"(queue: quorum, vhost: {args.vhost})",
+            f"OK - Publish/consume {summary} via {proto} ({queue_info}, vhost: {args.vhost})",
             perfdata,
         )
 
     except Exception as e:
         if client:
             try:
-                # Try to clean up the queue
-                client.delete_queue(queue_name)
-            except Exception:
-                pass
+                if should_delete and queue_was_created and not queue_existed_before:
+                    debug(f"Error path: attempting to clean up queue '{queue_name}'")
+                    client.delete_queue(queue_name)
+            except Exception as cleanup_err:
+                debug(f"Error path: cleanup failed: {safe(str(cleanup_err))}")
             client.close()
-        return (STATE_CRITICAL, f"CRITICAL - Publish/consume test failed: {e}", "")
+        return (STATE_CRITICAL, f"CRITICAL - Publish/consume test failed: {safe(str(e))}", "")
+
+
+def _cleanup_queue(client: AMQPClient, queue_name: str, should_delete: bool,
+                   queue_was_created: bool, queue_existed_before: bool) -> None:
+    """
+    Decide whether to delete the queue.
+    Rules:
+    - If --no-delete: never delete
+    - If queue existed before (not ours): never delete
+    - If we created it: delete
+    """
+    if not should_delete:
+        debug(f"Keeping queue '{queue_name}' (--no-delete)")
+        return
+    if queue_existed_before:
+        debug(f"Keeping queue '{queue_name}' (existed before this check, not ours to delete)")
+        return
+    if queue_was_created:
+        debug(f"Deleting queue '{queue_name}' (created by this check)")
+        client.delete_queue(queue_name)
+    else:
+        debug(f"Keeping queue '{queue_name}' (was not created by this check)")
 
 
 def check_queue_exists(args: argparse.Namespace) -> Tuple[int, str, str]:
-    """
-    Mode: queue_exists
-    Check if a specific queue exists and report its state.
-    """
+    """Check if a specific queue exists and report its state."""
     if not args.queue_name:
         return (STATE_UNKNOWN, "UNKNOWN - --queue-name is required for queue_exists mode", "")
-
+    debug(f"Checking if queue '{args.queue_name}' exists in vhost '{args.vhost}'")
     try:
         mgmt = _build_mgmt_client(args)
         queue = mgmt.get_queue(args.vhost, args.queue_name)
-
         if queue is None:
-            return (
-                STATE_CRITICAL,
-                f"CRITICAL - Queue '{args.queue_name}' does not exist in vhost '{args.vhost}'",
-                "",
-            )
-
+            debug(f"Queue '{args.queue_name}' does not exist")
+            return (STATE_CRITICAL,
+                    f"CRITICAL - Queue '{args.queue_name}' does not exist in vhost '{args.vhost}'", "")
         msg_count = queue.get("messages", 0)
         consumers = queue.get("consumers", 0)
         q_type = queue.get("type", "unknown")
         state = queue.get("state", "unknown")
-
-        perfdata = (
-            f"messages={msg_count};;;; "
-            f"consumers={consumers};;;; "
-            f"messages_ready={queue.get('messages_ready', 0)};;;; "
-            f"messages_unacked={queue.get('messages_unacknowledged', 0)};;;;"
-        )
-
+        debug(f"Queue found: type={q_type}, state={state}, messages={msg_count}, consumers={consumers}")
+        perfdata = (f"messages={msg_count};;;; consumers={consumers};;;; "
+                    f"messages_ready={queue.get('messages_ready', 0)};;;; "
+                    f"messages_unacked={queue.get('messages_unacknowledged', 0)};;;;")
         if state != "running":
-            return (
-                STATE_WARNING,
-                f"WARNING - Queue '{args.queue_name}' exists but state is '{state}' "
-                f"(type={q_type}, messages={msg_count}, consumers={consumers})",
-                perfdata,
-            )
-
-        return (
-            STATE_OK,
-            f"OK - Queue '{args.queue_name}' exists and is running "
-            f"(type={q_type}, messages={msg_count}, consumers={consumers})",
-            perfdata,
-        )
-
+            return (STATE_WARNING,
+                    f"WARNING - Queue '{args.queue_name}' exists but state is '{state}' "
+                    f"(type={q_type}, messages={msg_count}, consumers={consumers})", perfdata)
+        return (STATE_OK,
+                f"OK - Queue '{args.queue_name}' exists and is running "
+                f"(type={q_type}, messages={msg_count}, consumers={consumers})", perfdata)
     except Exception as e:
-        return (STATE_CRITICAL, f"CRITICAL - Failed to check queue: {e}", "")
+        return (STATE_CRITICAL, f"CRITICAL - Failed to check queue: {safe(str(e))}", "")
 
 
 def check_queue_count(args: argparse.Namespace) -> Tuple[int, str, str]:
-    """
-    Mode: queue_count
-    Count the number of queues, optionally filtered by vhost.
-    """
+    """Count the number of queues, optionally filtered by vhost."""
+    debug("Starting queue_count check")
     try:
         mgmt = _build_mgmt_client(args)
         vhost = args.vhost if args.vhost != "/" or args.filter_vhost else None
         if args.filter_vhost:
             vhost = args.filter_vhost
-
+        debug(f"Counting queues in vhost: {vhost or 'all vhosts'}")
         queues = mgmt.get_queues(vhost)
         count = len(queues)
-
+        debug(f"Found {count} queue(s)")
         perfdata = f"queue_count={count};"
         if args.warning is not None:
             perfdata += f"{args.warning}"
@@ -862,48 +1147,35 @@ def check_queue_count(args: argparse.Namespace) -> Tuple[int, str, str]:
         if args.critical is not None:
             perfdata += f"{args.critical}"
         perfdata += ";0;"
-
         vhost_label = vhost if vhost else "all vhosts"
-
         if args.critical is not None and count >= args.critical:
-            return (
-                STATE_CRITICAL,
-                f"CRITICAL - {count} queues found in {vhost_label} (threshold: {args.critical})",
-                perfdata,
-            )
+            return (STATE_CRITICAL,
+                    f"CRITICAL - {count} queues found in {vhost_label} (threshold: {args.critical})", perfdata)
         if args.warning is not None and count >= args.warning:
-            return (
-                STATE_WARNING,
-                f"WARNING - {count} queues found in {vhost_label} (threshold: {args.warning})",
-                perfdata,
-            )
-
+            return (STATE_WARNING,
+                    f"WARNING - {count} queues found in {vhost_label} (threshold: {args.warning})", perfdata)
         return (STATE_OK, f"OK - {count} queues in {vhost_label}", perfdata)
-
     except Exception as e:
-        return (STATE_CRITICAL, f"CRITICAL - Failed to count queues: {e}", "")
+        return (STATE_CRITICAL, f"CRITICAL - Failed to count queues: {safe(str(e))}", "")
 
 
 def check_exchange_count(args: argparse.Namespace) -> Tuple[int, str, str]:
-    """
-    Mode: exchange_count
-    Count the number of exchanges, optionally filtered by vhost.
-    """
+    """Count the number of exchanges, optionally filtered by vhost."""
+    debug("Starting exchange_count check")
     try:
         mgmt = _build_mgmt_client(args)
         vhost = args.vhost if args.vhost != "/" or args.filter_vhost else None
         if args.filter_vhost:
             vhost = args.filter_vhost
-
+        debug(f"Counting exchanges in vhost: {vhost or 'all vhosts'}")
         exchanges = mgmt.get_exchanges(vhost)
-        # Exclude default AMQP exchanges (amq.* and empty-name)
+        total_raw = len(exchanges)
         if not args.include_defaults:
-            exchanges = [
-                e for e in exchanges
-                if e.get("name", "") and not e["name"].startswith("amq.")
-            ]
+            exchanges = [e for e in exchanges if e.get("name", "") and not e["name"].startswith("amq.")]
+            debug(f"Found {total_raw} total exchanges, {len(exchanges)} after excluding defaults")
+        else:
+            debug(f"Found {total_raw} exchanges (including defaults)")
         count = len(exchanges)
-
         perfdata = f"exchange_count={count};"
         if args.warning is not None:
             perfdata += f"{args.warning}"
@@ -911,33 +1183,21 @@ def check_exchange_count(args: argparse.Namespace) -> Tuple[int, str, str]:
         if args.critical is not None:
             perfdata += f"{args.critical}"
         perfdata += ";0;"
-
         vhost_label = vhost if vhost else "all vhosts"
-
         if args.critical is not None and count >= args.critical:
-            return (
-                STATE_CRITICAL,
-                f"CRITICAL - {count} exchanges found in {vhost_label} (threshold: {args.critical})",
-                perfdata,
-            )
+            return (STATE_CRITICAL,
+                    f"CRITICAL - {count} exchanges found in {vhost_label} (threshold: {args.critical})", perfdata)
         if args.warning is not None and count >= args.warning:
-            return (
-                STATE_WARNING,
-                f"WARNING - {count} exchanges found in {vhost_label} (threshold: {args.warning})",
-                perfdata,
-            )
-
+            return (STATE_WARNING,
+                    f"WARNING - {count} exchanges found in {vhost_label} (threshold: {args.warning})", perfdata)
         return (STATE_OK, f"OK - {count} exchanges in {vhost_label}", perfdata)
-
     except Exception as e:
-        return (STATE_CRITICAL, f"CRITICAL - Failed to count exchanges: {e}", "")
+        return (STATE_CRITICAL, f"CRITICAL - Failed to count exchanges: {safe(str(e))}", "")
 
 
 def check_cluster_health(args: argparse.Namespace) -> Tuple[int, str, str]:
-    """
-    Mode: cluster_health
-    Comprehensive cluster health check via Management API.
-    """
+    """Comprehensive cluster health check via Management API."""
+    debug("Starting cluster_health check")
     problems = []
     warnings = []
     info_parts = []
@@ -954,104 +1214,99 @@ def check_cluster_health(args: argparse.Namespace) -> Tuple[int, str, str]:
         info_parts.append(f"cluster={cluster_name}")
         info_parts.append(f"rabbitmq={rmq_version}")
         info_parts.append(f"erlang={erlang_version}")
+        debug(f"Cluster: {cluster_name}, RabbitMQ: {rmq_version}, Erlang: {erlang_version}")
 
-        # Listeners
         listeners = overview.get("listeners", [])
         listener_protos = set()
         for l in listeners:
             listener_protos.add(l.get("protocol", "unknown"))
+        debug(f"Listener protocols: {', '.join(sorted(listener_protos))}")
 
-        # Object totals
         obj_totals = overview.get("object_totals", {})
         total_queues = obj_totals.get("queues", 0)
         total_exchanges = obj_totals.get("exchanges", 0)
         total_connections = obj_totals.get("connections", 0)
         total_channels = obj_totals.get("channels", 0)
         total_consumers = obj_totals.get("consumers", 0)
+        debug(f"Object totals: queues={total_queues}, exchanges={total_exchanges}, "
+              f"connections={total_connections}, channels={total_channels}, consumers={total_consumers}")
 
-        perfdata_parts.append(f"queues={total_queues};;;;")
-        perfdata_parts.append(f"exchanges={total_exchanges};;;;")
-        perfdata_parts.append(f"connections={total_connections};;;;")
-        perfdata_parts.append(f"channels={total_channels};;;;")
-        perfdata_parts.append(f"consumers={total_consumers};;;;")
+        perfdata_parts.extend([
+            f"queues={total_queues};;;;", f"exchanges={total_exchanges};;;;",
+            f"connections={total_connections};;;;", f"channels={total_channels};;;;",
+            f"consumers={total_consumers};;;;",
+        ])
 
-        # Message stats from overview
         queue_totals = overview.get("queue_totals", {})
         total_messages = queue_totals.get("messages", 0)
         messages_ready = queue_totals.get("messages_ready", 0)
         messages_unacked = queue_totals.get("messages_unacknowledged", 0)
-        perfdata_parts.append(f"messages={total_messages};;;;")
-        perfdata_parts.append(f"messages_ready={messages_ready};;;;")
-        perfdata_parts.append(f"messages_unacked={messages_unacked};;;;")
+        perfdata_parts.extend([
+            f"messages={total_messages};;;;", f"messages_ready={messages_ready};;;;",
+            f"messages_unacked={messages_unacked};;;;",
+        ])
 
         # ---- Nodes ----
+        debug("Fetching node details")
         nodes = mgmt.get_nodes()
         total_nodes = len(nodes)
         running_nodes = 0
         maintenance_nodes = 0
-        disk_alarm_nodes = 0
-        mem_alarm_nodes = 0
-        node_names = []
 
         for node in nodes:
             name = node.get("name", "unknown")
-            node_names.append(name)
             is_running = node.get("running", False)
             if is_running:
                 running_nodes += 1
+            debug(f"Node '{name}': running={is_running}")
 
-            # Check maintenance mode (drain status)
             if node.get("maintenance_status", "") == "draining" or node.get("being_drained", False):
                 maintenance_nodes += 1
+                debug(f"  Node '{name}' is in maintenance/draining mode")
 
-            # Memory alarm
             if node.get("mem_alarm", False):
-                mem_alarm_nodes += 1
                 problems.append(f"Memory alarm on {name}")
-
-            # Disk alarm
+                debug(f"  ALARM: memory alarm on '{name}'")
             if node.get("disk_free_alarm", False):
-                disk_alarm_nodes += 1
                 problems.append(f"Disk free alarm on {name}")
+                debug(f"  ALARM: disk free alarm on '{name}'")
 
-            # File descriptors
             fd_used = node.get("fd_used", 0)
             fd_total = node.get("fd_total", 1)
             if fd_total > 0 and fd_used / fd_total > 0.9:
                 warnings.append(f"FD usage high on {name}: {fd_used}/{fd_total}")
+                debug(f"  WARNING: FD usage {fd_used}/{fd_total}")
+            else:
+                debug(f"  FD: {fd_used}/{fd_total}")
 
-            # Socket descriptors
             sock_used = node.get("sockets_used", 0)
             sock_total = node.get("sockets_total", 1)
             if sock_total > 0 and sock_used / sock_total > 0.9:
                 warnings.append(f"Socket usage high on {name}: {sock_used}/{sock_total}")
+            else:
+                debug(f"  Sockets: {sock_used}/{sock_total}")
 
-            # Memory usage
             mem_used = node.get("mem_used", 0)
             mem_limit = node.get("mem_limit", 0)
             if mem_limit > 0:
                 mem_pct = (mem_used / mem_limit) * 100
+                debug(f"  Memory: {mem_used // (1024*1024)}MB / {mem_limit // (1024*1024)}MB ({mem_pct:.1f}%)")
                 if mem_pct > 90:
                     warnings.append(f"Memory usage high on {name}: {mem_pct:.1f}%")
 
-            # Disk free
             disk_free = node.get("disk_free", 0)
             disk_free_limit = node.get("disk_free_limit", 0)
             if disk_free_limit > 0 and disk_free > 0:
                 disk_ratio = disk_free / disk_free_limit
+                debug(f"  Disk free: {disk_free // (1024*1024)}MB (limit: {disk_free_limit // (1024*1024)}MB)")
                 if disk_ratio < 1.5:
-                    warnings.append(
-                        f"Disk free low on {name}: {disk_free // (1024*1024)}MB "
-                        f"(limit: {disk_free_limit // (1024*1024)}MB)"
-                    )
+                    warnings.append(f"Disk free low on {name}: {disk_free // (1024*1024)}MB "
+                                    f"(limit: {disk_free_limit // (1024*1024)}MB)")
 
-            # Per-node perfdata
             short_name = name.split("@")[-1] if "@" in name else name
             short_name = short_name.replace(".", "_")
             if mem_limit > 0:
-                perfdata_parts.append(
-                    f"{short_name}_mem_pct={(mem_used / mem_limit * 100):.1f}%;90;95;0;100"
-                )
+                perfdata_parts.append(f"{short_name}_mem_pct={(mem_used / mem_limit * 100):.1f}%;90;95;0;100")
             perfdata_parts.append(f"{short_name}_fd_used={fd_used};;;;{fd_total}")
             perfdata_parts.append(f"{short_name}_sockets_used={sock_used};;;;{sock_total}")
 
@@ -1060,39 +1315,40 @@ def check_cluster_health(args: argparse.Namespace) -> Tuple[int, str, str]:
 
         if not nodes:
             problems.append("No nodes reported by management API")
-
         if running_nodes < total_nodes:
             down_count = total_nodes - running_nodes
             problems.append(f"{down_count}/{total_nodes} nodes not running")
-
         if maintenance_nodes > 0:
             warnings.append(f"{maintenance_nodes} node(s) in maintenance/draining mode")
 
         info_parts.append(f"nodes={running_nodes}/{total_nodes} running")
         info_parts.append(f"protocols={','.join(sorted(listener_protos))}")
-
         if maintenance_nodes > 0:
             info_parts.append(f"maintenance={maintenance_nodes}")
 
         # ---- Health checks ----
+        debug("Running RabbitMQ health check endpoints")
         health = mgmt.get_health_checks()
         for endpoint, result in health.items():
             if result.get("status") == 200:
-                # Check response body for alarm details
                 data = result.get("data", {})
                 if isinstance(data, dict) and data.get("status") == "ok":
+                    debug(f"Health check {endpoint}: passed")
                     continue
                 elif isinstance(data, dict) and data.get("status") == "failed":
                     reason = data.get("reason", "unknown")
-                    problems.append(f"Health check {endpoint} failed: {reason}")
+                    problems.append(f"Health check {endpoint} failed: {safe(str(reason))}")
+                    debug(f"Health check {endpoint}: FAILED - {safe(str(reason))}")
             elif result.get("status", 0) > 0:
-                problems.append(
-                    f"Health check {endpoint} returned HTTP {result['status']}"
-                )
+                http_status = result["status"]
+                desc = HTTP_STATUS_DESCRIPTIONS.get(http_status, "")
+                detail = f"Health check {endpoint} returned HTTP {http_status}"
+                if desc:
+                    detail += f" ({desc})"
+                problems.append(detail)
             else:
-                warnings.append(
-                    f"Health check {endpoint} error: {result.get('error', 'unknown')}"
-                )
+                err_msg = safe(str(result.get("error", "unknown")))
+                warnings.append(f"Health check {endpoint} error: {err_msg}")
 
         # ---- Build output ----
         perfdata = " ".join(perfdata_parts)
@@ -1102,27 +1358,19 @@ def check_cluster_health(args: argparse.Namespace) -> Tuple[int, str, str]:
             detail = "; ".join(problems)
             if warnings:
                 detail += " | Warnings: " + "; ".join(warnings)
-            return (
-                STATE_CRITICAL,
-                f"CRITICAL - {detail} [{info_str}]",
-                perfdata,
-            )
+            debug(f"Result: CRITICAL - {detail}")
+            return (STATE_CRITICAL, f"CRITICAL - {detail} [{info_str}]", perfdata)
         elif warnings:
             detail = "; ".join(warnings)
-            return (
-                STATE_WARNING,
-                f"WARNING - {detail} [{info_str}]",
-                perfdata,
-            )
+            debug(f"Result: WARNING - {detail}")
+            return (STATE_WARNING, f"WARNING - {detail} [{info_str}]", perfdata)
         else:
-            return (
-                STATE_OK,
-                f"OK - Cluster healthy [{info_str}]",
-                perfdata,
-            )
+            debug("Result: OK - cluster healthy")
+            return (STATE_OK, f"OK - Cluster healthy [{info_str}]", perfdata)
 
     except Exception as e:
-        return (STATE_CRITICAL, f"CRITICAL - Cluster health check failed: {e}", "")
+        debug(f"cluster_health exception: {safe(str(e))}")
+        return (STATE_CRITICAL, f"CRITICAL - Cluster health check failed: {safe(str(e))}", "")
 
 
 # =============================================================================
@@ -1130,15 +1378,12 @@ def check_cluster_health(args: argparse.Namespace) -> Tuple[int, str, str]:
 # =============================================================================
 
 def _build_mgmt_client(args: argparse.Namespace) -> ManagementAPIClient:
+    scheme = "https" if args.mgmt_ssl else "http"
+    debug(f"Building Management API client: {scheme}://{args.host}:{args.mgmt_port} as user '{args.username}'")
     return ManagementAPIClient(
-        host=args.host,
-        port=args.mgmt_port,
-        username=args.username,
-        password=args.password,
-        use_ssl=args.mgmt_ssl,
-        ssl_ca_cert=args.ssl_ca_cert,
-        ssl_no_verify=args.ssl_no_verify,
-        timeout=args.timeout,
+        host=args.host, port=args.mgmt_port, username=args.username, password=args.password,
+        use_ssl=args.mgmt_ssl, ssl_ca_cert=args.ssl_ca_cert,
+        ssl_no_verify=args.ssl_no_verify, timeout=args.timeout,
     )
 
 
@@ -1146,7 +1391,7 @@ def _build_mgmt_client(args: argparse.Namespace) -> ManagementAPIClient:
 # Argument Parsing
 # =============================================================================
 
-VERSION = "1.0.0"
+VERSION = "1.2.0"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1159,54 +1404,66 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 MODES:
-  publish_consume   Create quorum queue, publish message, consume & verify (AMQP)
+  publish_consume   Publish message(s), consume & verify (AMQP)
   queue_exists      Check if a specific queue exists (Management API)
   queue_count       Count queues, apply thresholds (Management API)
   exchange_count    Count exchanges, apply thresholds (Management API)
   cluster_health    Comprehensive cluster health check (Management API)
 
 EXAMPLES:
-  # Publish/consume roundtrip test via AMQP
-  %(prog)s -m publish_consume -H rabbit1.example.com -u monitor -p secret
+  # Single-message roundtrip (default)
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret
 
-  # Same but using AMQPS (TLS)
-  %(prog)s -m publish_consume -H rabbit1.example.com -u monitor -p secret --amqps
+  # Publish 500 messages, consume all back, verify
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret --message-count 500
 
-  # Check if a specific queue exists
-  %(prog)s -m queue_exists -H rabbit1.example.com -u monitor -p secret --queue-name my.app.queue
+  # Publish continuously for 30 seconds, then consume all back
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret --publish-duration 30s
 
-  # Count queues with warning/critical thresholds
-  %(prog)s -m queue_count -H rabbit1.example.com -u monitor -p secret -w 100 -c 200
+  # Publish for 2 minutes on a persistent named queue
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret \\
+           --publish-duration 2m --queue-name stress.test --no-delete
 
-  # Full cluster health check
-  %(prog)s -m cluster_health -H rabbit1.example.com -u monitor -p secret
+  # Re-use an existing queue (queue is never deleted)
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret \\
+           --queue-name my.health.check.queue
 
-  # Use a non-default vhost
-  %(prog)s -m publish_consume -H rabbit1.example.com -u monitor -p secret --vhost /production
+  # Keep temp queue after test (--no-delete)
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret --no-delete
 
-  # Custom ports and TLS for management API
-  %(prog)s -m cluster_health -H rabbit1.example.com -u monitor -p secret \\
+  # AMQPS (TLS)
+  %(prog)s -m publish_consume -H rabbit1 -u monitor -p secret --amqps
+
+  # Cluster health with debug output
+  %(prog)s -m cluster_health -H rabbit1 -u monitor -p secret --debug
+
+  # Queue/exchange counts with thresholds
+  %(prog)s -m queue_count -H rabbit1 -u monitor -p secret -w 100 -c 500
+  %(prog)s -m exchange_count -H rabbit1 -u monitor -p secret -w 50 -c 100
+
+  # Check specific queue exists
+  %(prog)s -m queue_exists -H rabbit1 -u monitor -p secret --queue-name orders.in
+
+  # Management API over HTTPS
+  %(prog)s -m cluster_health -H rabbit1 -u monitor -p secret \\
            --mgmt-port 15671 --mgmt-ssl --ssl-ca-cert /etc/pki/ca.pem
 
 EXIT CODES:
-  0  OK
-  1  WARNING
-  2  CRITICAL
-  3  UNKNOWN
+  0  OK       - check passed
+  1  WARNING  - threshold exceeded or non-critical issue
+  2  CRITICAL - check failed, connection error, or critical threshold
+  3  UNKNOWN  - invalid arguments or unhandled error
 """,
     )
 
     parser.add_argument("-V", "--version", action="version", version=f"%(prog)s {VERSION}")
 
-    # Mode
     parser.add_argument(
-        "-m", "--mode",
-        required=True,
+        "-m", "--mode", required=True,
         choices=["publish_consume", "queue_exists", "queue_count", "exchange_count", "cluster_health"],
         help="Check mode to execute",
     )
 
-    # Connection
     conn = parser.add_argument_group("Connection options")
     conn.add_argument("-H", "--host", default="localhost", help="RabbitMQ hostname (default: localhost)")
     conn.add_argument("-u", "--username", default="guest", help="RabbitMQ username (default: guest)")
@@ -1214,46 +1471,55 @@ EXIT CODES:
     conn.add_argument("--vhost", default="/", help="AMQP vhost (default: /)")
     conn.add_argument("-t", "--timeout", type=int, default=10, help="Connection timeout in seconds (default: 10)")
 
-    # AMQP
     amqp = parser.add_argument_group("AMQP options (for publish_consume mode)")
     amqp.add_argument("--amqp-port", type=int, default=5672, help="AMQP port (default: 5672)")
-    amqp.add_argument("--amqps", action="store_true", help="Use AMQPS (TLS) for AMQP connection")
+    amqp.add_argument("--amqps", action="store_true", help="Use AMQPS (TLS)")
 
-    # Management API
-    mgmt = parser.add_argument_group("Management API options (for queue/exchange/health modes)")
+    mgmt = parser.add_argument_group("Management API options")
     mgmt.add_argument("--mgmt-port", type=int, default=15672, help="Management API port (default: 15672)")
     mgmt.add_argument("--mgmt-ssl", action="store_true", help="Use HTTPS for Management API")
 
-    # TLS
     tls = parser.add_argument_group("TLS/SSL options")
-    tls.add_argument("--ssl-ca-cert", help="Path to CA certificate file for TLS verification")
-    tls.add_argument("--ssl-cert", help="Path to client certificate file (for AMQPS mutual TLS)")
-    tls.add_argument("--ssl-key", help="Path to client private key file (for AMQPS mutual TLS)")
-    tls.add_argument("--ssl-no-verify", action="store_true", help="Disable TLS certificate verification (insecure)")
+    tls.add_argument("--ssl-ca-cert", help="CA certificate file for TLS verification")
+    tls.add_argument("--ssl-cert", help="Client certificate file (AMQPS mutual TLS)")
+    tls.add_argument("--ssl-key", help="Client private key file (AMQPS mutual TLS)")
+    tls.add_argument("--ssl-no-verify", action="store_true", help="Disable TLS cert verification (insecure)")
 
-    # Thresholds
     thresh = parser.add_argument_group("Thresholds")
-    thresh.add_argument(
-        "-w", "--warning", type=float, default=None,
-        help="Warning threshold (ms for publish_consume, count for queue/exchange_count)",
+    thresh.add_argument("-w", "--warning", type=float, default=None,
+                        help="Warning threshold (ms for publish_consume, count for queue/exchange_count)")
+    thresh.add_argument("-c", "--critical", type=float, default=None,
+                        help="Critical threshold (ms for publish_consume, count for queue/exchange_count)")
+
+    mode_opts = parser.add_argument_group("Mode-specific options")
+    mode_opts.add_argument(
+        "--queue-name",
+        help="Queue name. For queue_exists: required. For publish_consume: re-use "
+             "an existing queue instead of creating a temporary one.",
     )
-    thresh.add_argument(
-        "-c", "--critical", type=float, default=None,
-        help="Critical threshold (ms for publish_consume, count for queue/exchange_count)",
+    mode_opts.add_argument(
+        "--no-delete", action="store_true",
+        help="Do not delete the queue after publish_consume test",
+    )
+    mode_opts.add_argument("--filter-vhost",
+                           help="Filter by vhost for queue_count/exchange_count")
+    mode_opts.add_argument("--include-defaults", action="store_true",
+                           help="Include default AMQP exchanges (amq.*) in exchange_count")
+
+    vol = parser.add_argument_group("Publish volume (publish_consume mode, mutually exclusive)")
+    vol_ex = vol.add_mutually_exclusive_group()
+    vol_ex.add_argument(
+        "--message-count", type=int, default=None,
+        help="Number of messages to publish and consume (default: 1)",
+    )
+    vol_ex.add_argument(
+        "--publish-duration", type=str, default=None,
+        help="Publish messages continuously for this duration, then consume all. "
+             "Formats: '30' (seconds), '30s', '5m', '1m30s'.",
     )
 
-    # Mode-specific
-    mode_opts = parser.add_argument_group("Mode-specific options")
-    mode_opts.add_argument("--queue-name", help="Queue name (required for queue_exists mode)")
-    mode_opts.add_argument(
-        "--filter-vhost",
-        help="Filter by vhost for queue_count/exchange_count (overrides --vhost for filtering)",
-    )
-    mode_opts.add_argument(
-        "--include-defaults",
-        action="store_true",
-        help="Include default AMQP exchanges (amq.*) in exchange_count",
-    )
+    parser.add_argument("--debug", "-d", action="store_true",
+                        help="Enable debug output on stderr")
 
     return parser
 
@@ -1266,9 +1532,29 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # Override AMQP port if using AMQPS and port was not explicitly set
+    global _debug_enabled, _g_password, _g_username
+    _debug_enabled = args.debug
+    _g_password = args.password
+    _g_username = args.username
+
+    debug(f"check_rabbitmq v{VERSION} starting")
+    debug(f"Mode: {args.mode}")
+    debug(f"Host: {args.host}, AMQP port: {args.amqp_port}, Mgmt port: {args.mgmt_port}")
+    debug(f"Vhost: {args.vhost}, User: {args.username}, Password: ***")
+    debug(f"AMQPS: {args.amqps}, Mgmt SSL: {args.mgmt_ssl}, SSL no-verify: {args.ssl_no_verify}")
+    debug(f"Timeout: {args.timeout}s, Warning: {args.warning}, Critical: {args.critical}")
+    if args.mode == "publish_consume":
+        debug(f"Queue name: {args.queue_name or '(auto-generated)'}, No-delete: {args.no_delete}")
+        if args.message_count:
+            debug(f"Message count: {args.message_count}")
+        elif args.publish_duration:
+            debug(f"Publish duration: {args.publish_duration}")
+        else:
+            debug("Message count: 1 (default)")
+
     if args.amqps and args.amqp_port == 5672:
         args.amqp_port = 5671
+        debug(f"Auto-switched AMQP port to {args.amqp_port} for AMQPS")
 
     mode_map = {
         "publish_consume": check_publish_consume,
@@ -1282,10 +1568,12 @@ def main() -> None:
         exit_code, message, perfdata = mode_map[args.mode](args)
     except Exception as e:
         exit_code = STATE_UNKNOWN
-        message = f"UNKNOWN - Unhandled exception: {e}"
+        message = f"UNKNOWN - Unhandled exception: {safe(str(e))}"
         perfdata = ""
+        debug(f"Unhandled exception: {safe(traceback.format_exc())}")
 
-    # Nagios-compatible output format: TEXT | perfdata
+    debug(f"Exit code: {exit_code} ({STATE_NAMES.get(exit_code, '?')})")
+
     if perfdata:
         print(f"{message} | {perfdata}")
     else:
