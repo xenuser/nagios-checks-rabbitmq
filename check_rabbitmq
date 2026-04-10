@@ -8,7 +8,8 @@
 # RabbitMQ Management HTTP API used for health, queue/exchange counts.
 #
 # Tested with: RabbitMQ 4.x, Python 3.9+ (RHEL 9 default)
-# License: MIT
+# License: GNU General Public License v3.0
+# Created by Valentin Hoebel valentin@xenuser.org
 # =============================================================================
 
 from __future__ import annotations
